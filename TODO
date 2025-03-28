@@ -1,0 +1,50 @@
+improvements (some easy, some not):
+🔧 recurrence:
+
+precompute decay masks once per max_seq_len, cache them.
+
+better: rewrite recurrence with implicit recurrence ala Mamba (SSM-style filtering), no full matrices.
+
+best: use state-space kernel convolution.
+
+🔧 moe:
+
+add router noise + load balancing loss (e.g., GShard-style aux loss).
+
+optionally use soft routing + sparse dropout.
+
+track expert usage, penalize overuse.
+
+🔧 serriform block:
+
+too many pathways. try ablations:
+
+conv-only
+
+recurrence-only
+
+moe-only
+
+fusion of just two (e.g., conv + moe)
+
+monitor FLOPs and runtime per block.
+
+🔧 generation:
+
+support past_key_values-style streaming for faster autoregressive use.
+
+shift cache update to be in-place to reduce allocations.
+
+🔧 training:
+
+track gradient norms per-layer (e.g., for exploding grads).
+
+plug in entropy-based loss term to encourage diversity in expert usage.
+
+consider fused optimizer (like fused adamw or 8-bit optimizers if training large models)
+
+🔧 modularity:
+
+split serriform block into submodules that can be toggled.
+
+give an arch_config.json or similar that toggles features like recurrence, moe, conv, ff etc.

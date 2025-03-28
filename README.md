@@ -16,6 +16,34 @@ A novel sequence learning model architecture that combines hierarchical token me
 - Memory-efficient implementation with forward/backward compatibility
 - Ready for research and experimentation
 
+## Improvements & Features
+
+### Modular Architecture
+- Fully configurable model components via architecture config:
+  - Enable/disable convolution, recurrence, MoE, or low-rank feedforward layers
+  - Configure kernel sizes, dilation growth, experts count, etc.
+  - Create leaner or specialized variants with focused components
+
+### Enhanced Recurrence
+- Memory-efficient precomputed decay masks cached for reuse
+- Support for maximum sequence length specification
+- Compatible with Hugging Face style `past_key_values` for integration
+
+### Mixture of Experts
+- Router noise for improved exploration during training
+- GShard-style load balancing auxiliary loss for even expert utilization
+- Expert usage tracking and entropy-based regularization
+
+### Streaming Generation
+- Supports token-by-token streaming output via generator API
+- In-place cache updates to reduce memory allocations
+- Optimized autoregressive performance
+
+### Monitoring & Analysis
+- Per-layer gradient norm tracking for training stability
+- Expert usage visualization
+- MoE auxiliary loss tracking
+
 ## Architecture Overview
 
 ![SerriformNet Architecture](https://github.com/NimraProject/SerriformNet/blob/28fff94bbe213222ba3c8acb6137e150e8a38d7b/serriform_architecture.png)
@@ -54,16 +82,35 @@ pip install -r requirements.txt
 python train.py --data_path /path/to/your/data --dim 512 --num_layers 12 --max_seq_len 1024
 ```
 
-Additional arguments:
-- `--dim`: Hidden dimension size (default: 512)
-- `--num_layers`: Number of Serriform blocks (default: 12)
-- `--max_seq_len`: Maximum sequence length (default: 1024)
-- `--batch_size`: Training batch size (default: 32)
-- `--epochs`: Number of training epochs (default: 10)
-- `--lr`: Learning rate (default: 5e-5)
-- `--device`: Device to use (default: cuda if available, else cpu)
+#### Architecture Ablation Studies
 
-### Inference
+Study the contribution of different components:
+
+```bash
+# Convolution-only variant
+python train.py --no_recurrence --no_moe --no_lowrank_ff
+
+# Recurrence-only variant
+python train.py --no_conv --no_moe --no_lowrank_ff
+
+# MoE-only variant
+python train.py --no_conv --no_recurrence --no_lowrank_ff
+```
+
+#### Additional Configuration Options
+
+```bash
+# Adjust MoE configuration
+python train.py --num_experts 8 --top_k_experts 2 --router_noise 0.02 --entropy_weight 0.01
+
+# Adjust recurrence for longer context
+python train.py --max_seq_len 4096 --memory_dim_factor 8
+
+# Change activation function
+python train.py --activation gelu 
+```
+
+### Inference with Streaming
 
 ```python
 import torch
@@ -74,13 +121,57 @@ model = SerriformNet(vocab_size=50257, dim=512, num_layers=12)
 model.load_state_dict(torch.load('serriformnet_checkpoint.pt'))
 model.eval()
 
-# Generate text
+# Standard generation
 prompt_ids = torch.tensor([[1, 2, 3, 4]]) # Your tokenized prompt
 generated = model.generate(
     prompt_ids, 
     max_new_tokens=100, 
     temperature=0.7, 
     top_k=50
+)
+
+# Streaming generation
+prompt_ids = torch.tensor([[1, 2, 3, 4]])
+for token in model.generate(
+    prompt_ids,
+    max_new_tokens=100,
+    temperature=0.7,
+    streaming=True
+):
+    print(token.item())  # Process tokens as they're generated
+```
+
+## Custom Model Variants
+
+Create configuration files for specialized model variants:
+
+```python
+# Convolutional-focused model
+conv_config = {
+    "use_conv": True,
+    "use_recurrence": False,
+    "use_moe": False,
+    "use_lowrank_ff": True,
+    "conv_kernel_size": 5,
+    "conv_dilation_growth": 2.5,
+    "ff_reduction_factor": A 
+}
+
+# Recurrence-focused model
+recurrence_config = {
+    "use_conv": False,
+    "use_recurrence": True,
+    "use_moe": False,
+    "use_lowrank_ff": True,
+    "memory_dim_factor": 2  # Larger memory dimension
+}
+
+# Load with custom configuration
+model = SerriformNet(
+    vocab_size=50257, 
+    dim=512, 
+    num_layers=12,
+    arch_config=conv_config  # or recurrence_config
 )
 ```
 
