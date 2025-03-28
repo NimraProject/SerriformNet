@@ -9,9 +9,16 @@ A novel sequence learning model architecture that combines hierarchical token me
 - **Competitive Inference Speed**: Especially on embedded devices and for sequences < 4K tokens
 - **Training Stability**: Recurrent + convolution fusion avoids vanishing gradient issues seen in deep RNNs
 
+## Development Status
+
+✅ **Stable**: All unit tests passing
+- Fixed tensor dimension handling in the structured state recurrence module
+- Memory-efficient implementation with forward/backward compatibility
+- Ready for research and experimentation
+
 ## Architecture Overview
 
-![SerriformNet Architecture](https://github.com/NimraProject/SerriformNet/raw/main/serriform_architecture.png)
+![SerriformNet Architecture](https://github.com/NimraProject/SerriformNet/blob/28fff94bbe213222ba3c8acb6137e150e8a38d7b/serriform_architecture.png)
 
 1. **Input Embedding Layer**
    - Standard embedding + linear projection

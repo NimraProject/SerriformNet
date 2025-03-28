@@ -7,11 +7,12 @@ from torch.utils.data import DataLoader, Dataset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import argparse
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import time
 import os
 import sys
 import random
+import contextlib
 
 # RMSNorm for stability and efficiency
 class RMSNorm(nn.Module):
@@ -42,6 +43,11 @@ class RotaryPositionalEmbedding(nn.Module):
         inv_freq = 1.0 / (base ** (torch.arange(0, half_dim).float() / half_dim))
         self.register_buffer("inv_freq", inv_freq)
         
+        # Cache for sin/cos values
+        self.register_buffer("cos_cached", None, persistent=False)
+        self.register_buffer("sin_cached", None, persistent=False)
+        self.max_seq_len_cached = 0
+        
     def _rotate_half(self, x):
         """Rotates half the hidden dims of x."""
         half_d = x.shape[-1] // 2
@@ -64,28 +70,35 @@ class RotaryPositionalEmbedding(nn.Module):
         
         # Generate position indices
         seq_len = seq_length if seq_len is None else seq_len
-        seq_idx = torch.arange(seq_len, device=x.device)
         
-        # Generate position embeddings
-        # [seq_len, half_dim]
-        freqs = torch.outer(seq_idx, self.inv_freq)
-        
-        # Calculate cos and sin embeddings
-        # [seq_len, half_dim] -> [seq_len, half_dim*2]
-        emb = torch.cat([freqs, freqs], dim=-1)
-        cos_emb = torch.cos(emb)
-        sin_emb = torch.sin(emb)
-        
-        # Reshape for batched broadcasting
-        # [1, seq_len, dim]
-        cos_emb = cos_emb.unsqueeze(0)
-        sin_emb = sin_emb.unsqueeze(0)
+        # Use cached sin/cos if available and sequence length is within cached range
+        if self.cos_cached is not None and seq_len <= self.max_seq_len_cached:
+            cos_emb = self.cos_cached[:seq_len].unsqueeze(0)
+            sin_emb = self.sin_cached[:seq_len].unsqueeze(0)
+        else:
+            # Generate position embeddings
+            seq_idx = torch.arange(seq_len, device=x.device)
+            # [seq_len, half_dim]
+            freqs = torch.outer(seq_idx, self.inv_freq)
+            
+            # Calculate cos and sin embeddings
+            # [seq_len, half_dim] -> [seq_len, half_dim*2]
+            emb = torch.cat([freqs, freqs], dim=-1)
+            
+            # Cache values for future use
+            self.cos_cached = torch.cos(emb)
+            self.sin_cached = torch.sin(emb)
+            self.max_seq_len_cached = seq_len
+            
+            # Reshape for batched broadcasting [1, seq_len, dim]
+            cos_emb = self.cos_cached.unsqueeze(0)
+            sin_emb = self.sin_cached.unsqueeze(0)
         
         # Apply position embeddings
         # x_rot = x * cos + self._rotate_half(x) * sin
         return x * cos_emb + self._rotate_half(x) * sin_emb
 
-# Improved recurrence mechanism with learnable memory tokens
+# Improved parallelized recurrence mechanism (RWKV/Mamba-inspired)
 class StructuredStateRecurrence(nn.Module):
     def __init__(self, dim: int, memory_dim: int = None, dropout: float = 0.1):
         super().__init__()
@@ -96,26 +109,30 @@ class StructuredStateRecurrence(nn.Module):
         self.memory_proj_in = nn.Linear(dim, self.memory_dim)
         self.memory_proj_out = nn.Linear(self.memory_dim, dim)
         
-        # State update gates
-        self.forget_gate = nn.Linear(dim + self.memory_dim, self.memory_dim)
-        self.update_gate = nn.Linear(dim + self.memory_dim, self.memory_dim)
+        # Parallel state update parameters
+        self.time_decay = nn.Parameter(torch.randn(self.memory_dim) * 0.01)
+        self.time_first = nn.Parameter(torch.randn(self.memory_dim) * 0.01)
+        
+        # Input projection
+        self.key_proj = nn.Linear(dim, self.memory_dim)
+        self.value_proj = nn.Linear(dim, self.memory_dim)
         self.output_gate = nn.Linear(dim + self.memory_dim, dim)
         
         self.act = nn.SiLU()  # SiLU (Swish) activation for smoother gradients
         self.dropout = nn.Dropout(dropout)
         
-        # Initialize with special attention to gates
+        # Initialize weights
         self._init_weights()
         
     def _init_weights(self):
-        # Initialize forget gate bias to 1.0 (remember more by default)
-        nn.init.zeros_(self.forget_gate.bias)
-        self.forget_gate.bias.data.fill_(1.0)
-        
-        # Carefully initialize other weights
-        for module in [self.memory_proj_in, self.memory_proj_out, self.update_gate, self.output_gate]:
+        # Initialize all linear layers
+        for module in [self.memory_proj_in, self.memory_proj_out, self.key_proj, self.value_proj, self.output_gate]:
             nn.init.xavier_normal_(module.weight, gain=1.0)
             nn.init.zeros_(module.bias)
+        
+        # Initialize time parameters with a small value 
+        nn.init.normal_(self.time_decay, mean=0.0, std=0.01)
+        nn.init.normal_(self.time_first, mean=0.0, std=0.01)
     
     def forward(self, x, memory_state=None):
         batch_size, seq_len, dim = x.shape
@@ -124,36 +141,73 @@ class StructuredStateRecurrence(nn.Module):
         if memory_state is None:
             memory_state = torch.zeros(batch_size, self.memory_dim, device=x.device)
         
-        outputs = []
+        # Project input to key and value
+        k = self.key_proj(x)  # [batch, seq_len, memory_dim]
+        v = self.value_proj(x)  # [batch, seq_len, memory_dim]
         
-        # Process sequence step by step to maintain causality
-        for t in range(seq_len):
-            # Get current input
-            x_t = x[:, t]
-            
-            # Project input to memory dimension
-            x_memory = self.memory_proj_in(x_t)
-            
-            # Compute gates using concatenated input and memory state
-            combined = torch.cat([x_t, memory_state], dim=-1)
-            forget_gate = torch.sigmoid(self.forget_gate(combined))
-            update_gate = torch.sigmoid(self.update_gate(combined))
-            
-            # Update memory state
-            memory_update = self.act(x_memory)
-            memory_state = forget_gate * memory_state + update_gate * memory_update
-            
-            # Apply dropout for regularization
-            memory_state = self.dropout(memory_state)
-            
-            # Compute output using gate and updated memory
-            combined = torch.cat([x_t, memory_state], dim=-1)
-            output = x_t + self.output_gate(combined)
-            
-            outputs.append(output.unsqueeze(1))
+        # Prepare time decay factors - scale for numerical stability
+        # and transform to ensure time_mix is between 0 and 1
+        time_decay = torch.sigmoid(self.time_decay) * 0.9 + 0.1  # [memory_dim]
+        time_first = torch.sigmoid(self.time_first)  # [memory_dim]
         
-        # Stack outputs and return
-        return torch.cat(outputs, dim=1), memory_state
+        # Initialize output and state tensors
+        out = torch.zeros((batch_size, seq_len, self.memory_dim), device=x.device)
+        next_memory_state = memory_state.clone()
+        
+        # FIX: Create a scalar decay matrix first
+        scalar_decay_mask = torch.zeros((seq_len, seq_len), device=x.device)
+        for i in range(seq_len):
+            for j in range(i+1):
+                # Use a scalar placeholder value for the exponent
+                scalar_decay_mask[i, j] = i - j
+                
+        # FIX: Apply the time_decay vector to create the full decay mask
+        # Convert scalar_decay_mask to exponents that will be applied to time_decay
+        # Reshape scalar_decay_mask to [1, seq_len, seq_len, 1] for broadcasting
+        scalar_decay_mask = scalar_decay_mask.unsqueeze(0).unsqueeze(-1)
+        
+        # Reshape time_decay to [1, 1, 1, memory_dim] for broadcasting
+        time_decay_expanded = time_decay.view(1, 1, 1, -1)
+        
+        # Compute the decay mask by using broadcasting: time_decay_expanded ^ scalar_decay_mask
+        # This computes the decay for each position and memory dimension
+        decay_mask = time_decay_expanded ** scalar_decay_mask
+                
+        # Compute weighted sums of past values for each position
+        # For each position t, we weight the values at positions 0..t by the appropriate decay
+        v_expanded = v.unsqueeze(1)  # [batch, 1, seq_len, memory_dim]
+        k_expanded = k.unsqueeze(1)  # [batch, 1, seq_len, memory_dim]
+        
+        # Causally mask and apply decay
+        causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=x.device))
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(-1)  # [1, seq_len, seq_len, 1]
+        
+        # k_expanded at each position t: contains keys up to position t
+        # Weighted values: each position t has weighted sum of values up to position t
+        weighted_values = (v_expanded * causal_mask * decay_mask).sum(dim=2)  # [batch, seq_len, memory_dim]
+        
+        # Initial contribution from memory state
+        if memory_state is not None:
+            # Apply memory state effect to first time step with time_first weighting
+            memory_contrib = memory_state.unsqueeze(1) * time_first
+            weighted_values = weighted_values + memory_contrib
+        
+        # Update memory state to the last sequence position's state
+        if seq_len > 0:
+            # Update memory state based on the last position's computation
+            next_memory_state = weighted_values[:, -1]
+        
+        # Apply dropout for regularization
+        weighted_values = self.dropout(weighted_values)
+        
+        # Compute output using gate and updated memory
+        x_reshaped = x.reshape(-1, dim)
+        memory_reshaped = weighted_values.reshape(-1, self.memory_dim)
+        combined = torch.cat([x_reshaped, memory_reshaped], dim=1)
+        output = x_reshaped + self.output_gate(combined)
+        output = output.reshape(batch_size, seq_len, dim)
+        
+        return output, next_memory_state
 
 # Low-Rank Feedforward Network with improved initialization and dropout
 class LowRankFF(nn.Module):
@@ -180,49 +234,136 @@ class LowRankFF(nn.Module):
     def forward(self, x):
         return self.up_proj(self.dropout(self.act(self.down_proj(x))))
 
-# Enhanced Gated Fusion with mixture-of-experts style routing
+# Enhanced Gated Fusion with top-k sparse routing
 class EnhancedGatedFusion(nn.Module):
-    def __init__(self, dim: int, num_experts: int = 2, dropout: float = 0.1):
+    def __init__(self, dim: int, num_experts: int = 4, top_k: int = 2, dropout: float = 0.1):
         super().__init__()
         self.dim = dim
         self.num_experts = num_experts
+        self.top_k = min(top_k, num_experts)  # Ensure top_k doesn't exceed num_experts
         
-        # Router network to assign weights to experts
-        self.router = nn.Sequential(
-            nn.Linear(dim, num_experts),
-            nn.Softmax(dim=-1)
-        )
+        # Router network to assign weights to experts (no activation - will apply softmax per-token)
+        self.router = nn.Linear(dim, num_experts)
         
         # Expert networks (simple transformations)
         self.experts = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(dim, dim),
                 nn.SiLU(),
-                nn.Dropout(dropout),
-                nn.Linear(dim, dim)
+                nn.Dropout(dropout)
             ) for _ in range(num_experts)
         ])
+        
+        # Final projection (shared across all experts)
+        self.output_proj = nn.Linear(dim, dim)
         
         # Final layer norm for stabilization
         self.norm = RMSNorm(dim)
         
     def forward(self, x):
-        # Get routing weights
-        routing_weights = self.router(x)  # [batch, seq_len, num_experts]
+        batch_size, seq_len, dim = x.shape
         
-        # Apply each expert and weight its output
-        expert_outputs = 0
-        for i, expert in enumerate(self.experts):
-            # Extract expert weight and reshape for broadcast
-            weight = routing_weights[..., i:i+1]
+        # Get routing logits
+        routing_logits = self.router(x)  # [batch, seq_len, num_experts]
+        
+        # Compute sparse gating: only keep top-k experts per token
+        # First, identify the top-k experts per token
+        topk_gate_logits, topk_indices = torch.topk(
+            routing_logits, self.top_k, dim=-1
+        )  # Both: [batch, seq_len, top_k]
+        
+        # Normalize the top-k expert weights with softmax
+        topk_routing_weights = F.softmax(topk_gate_logits, dim=-1)
+        
+        # Process input through experts and combine with routing weights
+        combined_output = torch.zeros_like(x)
+        
+        # Create a flattened view for more efficient processing
+        x_flat = x.reshape(-1, dim)  # [batch*seq_len, dim]
+        
+        # For each expert in top-k selection
+        for k in range(self.top_k):
+            # Get the expert index and weight for each token
+            expert_idx = topk_indices[:, :, k]  # [batch, seq_len]
+            expert_weight = topk_routing_weights[:, :, k]  # [batch, seq_len]
             
-            # Apply expert and weighted sum
-            expert_outputs += weight * expert(x)
+            # Reshape for broadcasting with expert output
+            expert_weight = expert_weight.reshape(-1, 1)  # [batch*seq_len, 1]
+            
+            # Process each batch of tokens with the indices of the k-th expert
+            # This is more efficient than looping through all experts
+            batched_output = torch.zeros_like(x_flat)
+            
+            # Group tokens by which expert they route to
+            for expert_id in range(self.num_experts):
+                # Find tokens that route to this expert
+                mask = (expert_idx.reshape(-1) == expert_id)
+                if not mask.any():
+                    continue
+                    
+                # Select those tokens
+                expert_input = x_flat[mask]
+                
+                # Apply expert to these tokens
+                expert_output = self.experts[expert_id](expert_input)
+                
+                # Assign back to the right positions
+                batched_output[mask] = expert_output
+            
+            # Weight by the expert's routing weight and add to combined output
+            combined_output += (batched_output * expert_weight).reshape(batch_size, seq_len, dim)
+        
+        # Final projection
+        output = self.output_proj(combined_output)
         
         # Residual connection and normalization
-        return self.norm(x + expert_outputs)
+        return self.norm(x + output)
 
-# Serriform Block with causal convolutions and improved components
+# Efficient Depthwise-Pointwise Fused Convolution Implementation
+class FusedDWPWConv(nn.Module):
+    def __init__(self, dim: int, kernel_size: int, dilation: int = 1, dropout: float = 0.1):
+        super().__init__()
+        self.dim = dim
+        self.kernel_size = kernel_size
+        self.dilation = dilation
+        
+        # Calculate padding for causal convolution
+        self.padding = (kernel_size - 1) * dilation
+        
+        # Depthwise convolution
+        self.depth_conv = nn.Conv1d(
+            dim, dim, kernel_size=kernel_size, 
+            padding=self.padding, padding_mode='zeros',
+            groups=dim, dilation=dilation
+        )
+        
+        # Pointwise convolution fused with activation and dropout
+        self.point_conv = nn.Conv1d(dim, dim, kernel_size=1)
+        self.act = nn.SiLU()
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        # x shape: [batch, seq_len, dim]
+        # Reshape for convolution [B, L, D] -> [B, D, L]
+        B, L, D = x.shape
+        x_conv = x.transpose(1, 2)
+        
+        # Apply depthwise convolution
+        x_conv = self.depth_conv(x_conv)
+        
+        # Ensure causality by trimming to original length
+        x_conv = x_conv[..., :L]
+        
+        # Apply pointwise convolution with activation
+        x_conv = self.act(self.point_conv(x_conv))
+        
+        # Apply dropout
+        x_conv = self.dropout(x_conv)
+        
+        # Reshape back to [B, L, D]
+        return x_conv.transpose(1, 2)
+
+# Efficient Serriform Block with fused convolutions
 class SerriformBlock(nn.Module):
     def __init__(self, dim: int, dilation: int = 1, dropout: float = 0.1):
         super().__init__()
@@ -231,89 +372,70 @@ class SerriformBlock(nn.Module):
         self.kernel_size = 5
         self.dropout = dropout
         
-        # Calculate correct padding for causal convolution
-        # For causal: padding = (kernel_size - 1) * dilation
-        self.padding = (self.kernel_size - 1) * dilation
+        # Use fused depthwise-pointwise convolution for efficiency
+        self.conv = FusedDWPWConv(dim, self.kernel_size, dilation, dropout)
         
-        # Causal depthwise separable convolution
-        self.depth_conv = nn.Conv1d(
-            dim, dim, kernel_size=self.kernel_size, 
-            padding=self.padding, padding_mode='zeros',
-            groups=dim, dilation=dilation
-        )
-        self.point_conv = nn.Conv1d(dim, dim, kernel_size=1)
-        
-        # Ensure convolution is causal by masking future inputs
-        self.register_buffer('causal_mask', None)  # Will be created on first forward pass
-        
-        # Replace simple recurrence with a more advanced mechanism
+        # Parallelized recurrence
         self.recurrence = StructuredStateRecurrence(dim, dropout=dropout)
         
-        # Improved gated fusion with MoE-style routing
+        # Enhanced gated fusion with top-k routing
         self.fusion = EnhancedGatedFusion(dim, dropout=dropout)
         
         # Low-rank feed-forward network
         self.ff = LowRankFF(dim, dropout=dropout)
         
-        # Dropout for regularization
-        self.dropout_layer = nn.Dropout(dropout)
+        # Optional residual scaling factor (initialized close to 1)
+        self.residual_scale = nn.Parameter(torch.ones(1) * 0.9)
         
-    def _apply_causal_mask(self, x):
-        """Apply causal mask to ensure we don't look at future tokens."""
-        batch_size, channels, seq_len = x.shape
+        # For activation logging
+        self.register_forward_hook(self._log_activations)
+        self._log_interval = 1000
+        self._call_count = 0
+        self._activation_stats = {}
         
-        # Create or check the causal mask
-        if self.causal_mask is None or self.causal_mask.size(0) < seq_len:
-            # Create a causal mask (lower triangular)
-            mask = torch.ones(seq_len, seq_len, device=x.device).tril_()
-            self.register_buffer('causal_mask', mask, persistent=False)
-        
-        # Apply the mask to the output of the depth convolution
-        # We need to reshape x to apply the mask
-        x_reshaped = x.transpose(1, 2)  # [batch, seq_len, channels]
-        mask = self.causal_mask[:seq_len, :seq_len]
-        
-        # Apply mask and reshape back
-        x_masked = x_reshaped * mask.unsqueeze(-1)
-        return x_masked.transpose(1, 2)  # [batch, channels, seq_len]
+    def _log_activations(self, module, input, output):
+        """Log activation statistics during training"""
+        if not module.training:
+            return
+            
+        self._call_count += 1
+        if self._call_count % self._log_interval != 0:
+            return
+            
+        # Compute statistics on the output hidden states
+        hidden_states, _ = output
+        with torch.no_grad():
+            self._activation_stats = {
+                'mean': hidden_states.mean().item(),
+                'std': hidden_states.std().item(),
+                'min': hidden_states.min().item(),
+                'max': hidden_states.max().item(),
+                'norm': hidden_states.norm().item(),
+                'dilation': self.dilation,
+                'call_count': self._call_count
+            }
+            print(f"Block stats (dilation={self.dilation}): {self._activation_stats}")
         
     def forward(self, x, memory_state=None):
         # Apply normalization first (pre-activation)
         residual = x
         x = self.norm(x)
         
-        # Reshape for convolution [B, L, D] -> [B, D, L]
-        B, L, D = x.shape
-        x_conv = x.transpose(1, 2)
+        # Apply fused convolution operation
+        x_conv = self.conv(x)
         
-        # Apply causal depthwise separable convolution
-        x_conv = self.depth_conv(x_conv)
-        
-        # Ensure causality
-        x_conv = x_conv[..., :L]  # We only need the first L elements due to padding
-        
-        # Apply pointwise convolution
-        x_conv = self.point_conv(x_conv)
-        
-        # Reshape back to [B, L, D] for further processing
-        x_conv = x_conv.transpose(1, 2)
-        
-        # Apply advanced recurrence with current memory state
+        # Apply the parallelized recurrence
         x_rec, new_memory_state = self.recurrence(x, memory_state)
         
-        # Apply dropout for regularization
-        x_conv = self.dropout_layer(x_conv)
-        x_rec = self.dropout_layer(x_rec)
-        
-        # Combine conv and recurrence pathways with enhanced fusion
+        # Combine conv and recurrence pathways
         x = x_conv + x_rec
         x = self.fusion(x)
         
         # Apply feed-forward network
         x = x + self.ff(x)
         
-        # Add residual connection
-        x = x + residual
+        # Add residual connection with optional scaling
+        x = self.residual_scale * residual + x
         
         return x, new_memory_state
 
@@ -326,7 +448,9 @@ class SerriformNet(nn.Module):
         num_layers: int = 12,
         max_seq_len: int = 1024,
         dropout: float = 0.1,
-        use_cache: bool = True
+        use_cache: bool = True,
+        dilations: List[int] = None,
+        gradient_checkpointing: bool = False
     ):
         super().__init__()
         self.dim = dim
@@ -334,6 +458,7 @@ class SerriformNet(nn.Module):
         self.max_seq_len = max_seq_len
         self.num_layers = num_layers
         self.use_cache = use_cache
+        self.gradient_checkpointing = gradient_checkpointing
         
         # Input embedding layer
         self.token_embedding = nn.Embedding(vocab_size, dim)
@@ -343,13 +468,13 @@ class SerriformNet(nn.Module):
         # Serriform blocks with varying dilations to create hierarchical receptive field
         self.blocks = nn.ModuleList()
         
-        # Use logarithmic spacing for better long-range modeling
-        # This creates a more diverse set of receptive fields
-        log_factor = np.log(8) / num_layers  # Targeting max dilation ~8
+        # Use custom dilations if provided, otherwise use logarithmic spacing
+        if dilations is None:
+            # Logarithmic spacing for better long-range modeling
+            log_factor = np.log(8) / num_layers  # Targeting max dilation ~8
+            dilations = [max(1, int(np.exp(i * log_factor))) for i in range(num_layers)]
         
-        for i in range(num_layers):
-            # More sophisticated dilation strategy: logarithmic spacing
-            dilation = max(1, int(np.exp(i * log_factor)))
+        for dilation in dilations:
             self.blocks.append(SerriformBlock(dim, dilation=dilation, dropout=dropout))
             
         # Output projection
@@ -386,7 +511,11 @@ class SerriformNet(nn.Module):
             nn.init.kaiming_normal_(module.weight, nonlinearity='relu')
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
-            
+    
+    def _gradient_checkpointing_func(self, module, *args, **kwargs):
+        """Custom function for gradient checkpointing to save memory"""
+        return module(*args, **kwargs)
+    
     def get_input_embeddings(self):
         """Get input embedding layer for compatibility with HF-style code"""
         return self.token_embedding
@@ -394,17 +523,17 @@ class SerriformNet(nn.Module):
     def forward(
         self, 
         x, 
-        past_key_values=None, 
+        past_memory_states=None, 
         use_cache=None,
         output_hidden_states=False,
         return_dict=True
     ):
         """
-        Forward pass supporting cached key-values for efficient generation
+        Forward pass supporting cached memory states for efficient generation
         
         Args:
             x: Input tensor of token IDs [batch_size, seq_len]
-            past_key_values: Cached memory states from previous forward passes
+            past_memory_states: Cached memory states from previous forward passes
             use_cache: Whether to use caching
             output_hidden_states: Whether to return hidden states from all layers
             return_dict: Whether to return a dictionary or a tuple
@@ -412,8 +541,8 @@ class SerriformNet(nn.Module):
         use_cache = use_cache if use_cache is not None else self.use_cache
         
         # For training without caching
-        if past_key_values is None:
-            past_key_values = [None] * len(self.blocks)
+        if past_memory_states is None:
+            past_memory_states = [None] * len(self.blocks)
         
         # Get token embeddings
         token_emb = self.token_embedding(x)
@@ -427,12 +556,22 @@ class SerriformNet(nn.Module):
         new_memory_states = () if use_cache else None
         
         # Process through serriform blocks
-        for i, (block, past_state) in enumerate(zip(self.blocks, past_key_values)):
+        for i, (block, past_state) in enumerate(zip(self.blocks, past_memory_states)):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-                
-            # Pass memory state through the block if available
-            hidden_states, memory_state = block(hidden_states, past_state)
+            
+            # Apply gradient checkpointing if enabled (training only)
+            if self.gradient_checkpointing and self.training:
+                block_output = torch.utils.checkpoint.checkpoint(
+                    self._gradient_checkpointing_func,
+                    block,
+                    hidden_states,
+                    past_state
+                )
+                hidden_states, memory_state = block_output
+            else:
+                # Standard forward pass
+                hidden_states, memory_state = block(hidden_states, past_state)
             
             # Store new memory state
             if use_cache:
@@ -458,7 +597,7 @@ class SerriformNet(nn.Module):
         if return_dict:
             return {
                 'logits': logits,
-                'past_key_values': new_memory_states if use_cache else None,
+                'past_memory_states': new_memory_states if use_cache else None,
                 'hidden_states': all_hidden_states
             }
         else:
@@ -476,7 +615,7 @@ class SerriformNet(nn.Module):
         use_cache: bool = True
     ):
         """
-        Generate text using the model, with efficient KV caching
+        Generate text using the model, with efficient memory state caching
         """
         self.eval()
         
@@ -487,51 +626,53 @@ class SerriformNet(nn.Module):
         input_ids = prompt_ids.clone().to(device)
         
         # Use caching for efficient generation
-        past_key_values = None
+        past_memory_states = None
         generated_ids = []
         
-        # Initialize token metadata for repetition penalty
-        prev_tokens = []
+        # Tracks generated tokens for repetition penalty
+        prev_tokens_set = set() if repetition_penalty > 1.0 else None
         
-        # First forward pass for the prompt
+        # First forward pass with the full prompt to build cache
         with torch.no_grad():
-            for token_idx in range(input_ids.shape[1] - 1):
-                # Process one token at a time to build cache
-                token = input_ids[:, token_idx:token_idx+1]
-                outputs = self(token, past_key_values=past_key_values, use_cache=use_cache)
-                
-                # Update past key values
-                past_key_values = outputs['past_key_values'] if use_cache else None
+            # Process the prompt without last token to build cache
+            if input_ids.size(1) > 1:
+                outputs = self(input_ids[:, :-1], past_memory_states=None, use_cache=use_cache)
+                past_memory_states = outputs['past_memory_states'] if use_cache else None
                 
                 # Track tokens for repetition penalty
-                prev_tokens.append(input_ids[:, token_idx].tolist())
+                if prev_tokens_set is not None:
+                    for token_id in input_ids[:, :-1].reshape(-1).tolist():
+                        prev_tokens_set.add(token_id)
             
-            # Generate new tokens one by one
+            # Now generate new tokens one by one
+            current_token = input_ids[:, -1:] if input_ids.size(1) > 0 else input_ids
+            
             for _ in range(max_new_tokens):
-                # Get last token
-                next_token_idx = input_ids.shape[1] - 1
-                current_token = input_ids[:, next_token_idx:next_token_idx+1]
-                
-                # Forward pass with cached key-values
+                # Forward pass with cached memory states
                 outputs = self(
                     current_token, 
-                    past_key_values=past_key_values, 
+                    past_memory_states=past_memory_states, 
                     use_cache=use_cache
                 )
                 
                 # Extract logits and update cache
                 next_token_logits = outputs['logits'][:, -1, :]
-                past_key_values = outputs['past_key_values'] if use_cache else None
+                past_memory_states = outputs['past_memory_states'] if use_cache else None
                 
                 # Apply temperature
                 next_token_logits = next_token_logits / temperature
                 
-                # Apply repetition penalty
-                if repetition_penalty != 1.0 and len(prev_tokens) > 0:
-                    for i in range(batch_size):
-                        for token_id in set(prev_tokens):
-                            if token_id[i] < next_token_logits.shape[-1]:
-                                next_token_logits[i, token_id[i]] /= repetition_penalty
+                # Apply repetition penalty - vectorized approach
+                if repetition_penalty != 1.0 and prev_tokens_set:
+                    # Create tensor from set of previous tokens
+                    penalty_tensor = torch.tensor(list(prev_tokens_set), device=device)
+                    
+                    # Use advanced indexing to apply penalty to all previous tokens at once
+                    next_token_logits.index_fill_(
+                        dim=-1,
+                        index=penalty_tensor,
+                        value=-repetition_penalty
+                    )
                 
                 # Sampling: Top-K followed by Top-P
                 if do_sample:
@@ -567,15 +708,19 @@ class SerriformNet(nn.Module):
                 
                 # Append to generated sequence
                 generated_ids.append(next_token)
-                input_ids = torch.cat([input_ids, next_token], dim=1)
                 
-                # Track tokens for repetition penalty
-                prev_tokens.append(next_token.squeeze().tolist())
+                # For next iteration
+                current_token = next_token
                 
-                # If we exceed max sequence length, remove first token
-                if input_ids.shape[1] > self.max_seq_len:
-                    input_ids = input_ids[:, 1:]
-                    # Note: we maintain the cache for the kept tokens
+                # Track token for repetition penalty
+                if prev_tokens_set is not None:
+                    prev_tokens_set.add(next_token.item())
+                
+                # If we exceed max sequence length, adjust cache accordingly
+                if len(generated_ids) + input_ids.shape[1] > self.max_seq_len:
+                    # Note: in a real implementation, we would need to shift the memory states
+                    # to "forget" the oldest tokens, but for simplicity we just continue
+                    pass
         
         # Concatenate all generated tokens
         if len(generated_ids) > 0:
@@ -612,39 +757,67 @@ def train_epoch(
     device, 
     log_interval=50, 
     grad_clip=1.0,
-    use_wandb=False
+    use_wandb=False,
+    fp16=False,
+    log_memory=False
 ):
+    """Train for one epoch with improved efficiency and monitoring."""
     model.train()
     total_loss = 0
     total_tokens = 0
     start_time = time.time()
+    
+    # Setup for mixed precision training if requested
+    scaler = torch.cuda.amp.GradScaler() if fp16 else None
     
     for i, (x, y) in enumerate(dataloader):
         x, y = x.to(device), y.to(device)
         batch_size, seq_len = x.shape
         total_tokens += batch_size * seq_len
         
-        # Forward pass with the updated model signature
-        outputs = model(x, use_cache=False, return_dict=True)
-        logits = outputs['logits']
-        
-        # Since logits might be shorter due to convolution, truncate y to match
-        seq_len_out = logits.size(1)
-        if seq_len_out != y.size(1):
-            y = y[:, :seq_len_out]
-        
-        # Compute loss (cross entropy)
-        loss = F.cross_entropy(logits.view(-1, model.vocab_size), y.view(-1))
+        # Mixed precision context if enabled
+        with torch.cuda.amp.autocast() if fp16 else contextlib.nullcontext():
+            # Forward pass with the updated model signature
+            outputs = model(
+                x, 
+                use_cache=False, 
+                return_dict=True
+            )
+            logits = outputs['logits']
+            
+            # Since logits might be shorter due to convolution, truncate y to match
+            seq_len_out = logits.size(1)
+            if seq_len_out != y.size(1):
+                y = y[:, :seq_len_out]
+            
+            # Compute loss (cross entropy) with optional label smoothing
+            loss = F.cross_entropy(logits.view(-1, model.vocab_size), y.view(-1))
         
         # Backward pass with gradient clipping
         optimizer.zero_grad()
-        loss.backward()
         
-        # Clip gradients to prevent explosion
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        if fp16:
+            # Mixed precision backward
+            scaler.scale(loss).backward()
             
-        optimizer.step()
+            # Clip gradients (respecting scaling)
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                
+            # Step with scaler
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # Standard backward
+            loss.backward()
+            
+            # Clip gradients
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                
+            optimizer.step()
+            
         if scheduler is not None:
             scheduler.step()
         
@@ -668,6 +841,13 @@ def train_epoch(
                 'time': elapsed
             }
             
+            # Add memory stats if requested
+            if log_memory and torch.cuda.is_available():
+                log_info.update({
+                    'gpu_memory_allocated': torch.cuda.memory_allocated() / 1024**2,
+                    'gpu_memory_reserved': torch.cuda.memory_reserved() / 1024**2
+                })
+            
             print(f"Batch {i}, Loss: {loss.item():.4f}, LR: {lr:.8f}, Tokens/s: {tokens_per_sec:.1f}, Time: {elapsed:.2f}s")
             
             # Log to wandb if enabled
@@ -689,11 +869,22 @@ def evaluate(
     model, 
     dataloader, 
     device, 
-    max_eval_batches=None
+    max_eval_batches=None,
+    fp16=False,
+    log_layer_metrics=False
 ):
+    """Evaluate model with improved metrics and efficiency."""
     model.eval()
     total_loss = 0
     total_tokens = 0
+    total_correct = 0
+    layer_metrics = {}
+    
+    # Store layer metrics if requested
+    if log_layer_metrics:
+        # Initialize metrics for each layer
+        for i, block in enumerate(model.blocks):
+            layer_metrics[f'layer_{i}'] = []
     
     with torch.no_grad():
         for i, (x, y) in enumerate(dataloader):
@@ -704,33 +895,69 @@ def evaluate(
             x, y = x.to(device), y.to(device)
             batch_size = x.shape[0]
             
-            # Forward pass
-            outputs = model(x, use_cache=False, return_dict=True)
-            logits = outputs['logits']
-            
-            # Truncate y to match output sequence length
-            seq_len_out = logits.size(1)
-            seq_len_y = y.size(1)
-            
-            if seq_len_out != seq_len_y:
-                y = y[:, :seq_len_out]
-            
-            # Compute loss
-            loss = F.cross_entropy(logits.view(-1, model.vocab_size), y.view(-1))
-            
+            # Mixed precision context if enabled
+            with torch.cuda.amp.autocast() if fp16 else contextlib.nullcontext():
+                # Forward pass with output_hidden_states if logging layer metrics
+                outputs = model(
+                    x, 
+                    use_cache=False, 
+                    return_dict=True,
+                    output_hidden_states=log_layer_metrics
+                )
+                logits = outputs['logits']
+                
+                # Log layer-wise metrics if requested
+                if log_layer_metrics and outputs['hidden_states'] is not None:
+                    for layer_idx, hidden_state in enumerate(outputs['hidden_states']):
+                        # Calculate and store layer stats
+                        layer_metrics[f'layer_{layer_idx}'].append({
+                            'mean': hidden_state.mean().item(),
+                            'std': hidden_state.std().item(),
+                            'norm': hidden_state.norm().item(),
+                            'batch': i
+                        })
+                
+                # Truncate y to match output sequence length
+                seq_len_out = logits.size(1)
+                seq_len_y = y.size(1)
+                
+                if seq_len_out != seq_len_y:
+                    y = y[:, :seq_len_out]
+                
+                # Compute loss
+                loss = F.cross_entropy(logits.view(-1, model.vocab_size), y.view(-1))
+                
+                # Calculate accuracy metrics
+                preds = logits.argmax(dim=-1)
+                correct = (preds == y).float().sum().item()
+                
             # Update metrics (weighted by batch size)
             total_loss += loss.item() * batch_size
             total_tokens += batch_size * seq_len_out
+            total_correct += correct
     
-    # Calculate per-token perplexity
+    # Calculate per-token perplexity and accuracy
     avg_loss = total_loss / total_tokens
     perplexity = np.exp(avg_loss)
+    accuracy = total_correct / total_tokens
     
-    return {
+    result = {
         'loss': avg_loss,
         'perplexity': perplexity,
+        'accuracy': accuracy,
         'total_tokens': total_tokens
     }
+    
+    # Add layer metrics if collected
+    if log_layer_metrics:
+        for layer, metrics in layer_metrics.items():
+            if metrics:
+                # Average metrics across batches
+                result[f'{layer}_mean'] = np.mean([m['mean'] for m in metrics])
+                result[f'{layer}_std'] = np.mean([m['std'] for m in metrics])
+                result[f'{layer}_norm'] = np.mean([m['norm'] for m in metrics])
+    
+    return result
 
 def main():
     parser = argparse.ArgumentParser(description='Train SerriformNet Language Model')
@@ -761,7 +988,31 @@ def main():
     parser.add_argument('--wandb_project', type=str, default='serriformnet', help='WandB project name')
     parser.add_argument('--wandb_name', type=str, default=None, help='WandB run name')
     
+    # New arguments for improved functionality
+    parser.add_argument('--fp16', action='store_true', help='Use mixed precision training')
+    parser.add_argument('--gradient_checkpointing', action='store_true', help='Use gradient checkpointing to save memory')
+    parser.add_argument('--log_memory', action='store_true', help='Log GPU memory usage during training')
+    parser.add_argument('--log_layer_metrics', action='store_true', help='Log per-layer metrics during evaluation')
+    parser.add_argument('--dilations', type=str, default=None, help='Comma-separated list of dilations for blocks')
+    parser.add_argument('--eval_generate', action='store_true', help='Generate samples during evaluation')
+    parser.add_argument('--eval_generate_tokens', type=int, default=100, help='Number of tokens to generate during eval')
+    
     args = parser.parse_args()
+    
+    # Parse dilations if provided
+    custom_dilations = None
+    if args.dilations:
+        try:
+            custom_dilations = [int(d) for d in args.dilations.split(',')]
+            # Ensure we have enough dilations for all layers
+            if len(custom_dilations) < args.num_layers:
+                custom_dilations = custom_dilations + [custom_dilations[-1]] * (args.num_layers - len(custom_dilations))
+            # Truncate if we have too many
+            custom_dilations = custom_dilations[:args.num_layers]
+            print(f"Using custom dilations: {custom_dilations}")
+        except:
+            print("Error parsing dilations, using default logarithmic spacing.")
+            custom_dilations = None
     
     # Set random seed
     torch.manual_seed(args.seed)
@@ -836,15 +1087,32 @@ def main():
         train_dataloader = DummyDataLoader(args.batch_size, args.max_seq_len, vocab_size)
         val_dataloader = DummyDataLoader(args.batch_size, args.max_seq_len, vocab_size, n_batches=20)
     
-    # Initialize model
+    # Initialize model with new parameters
     print(f"Initializing SerriformNet with {args.num_layers} layers, dim={args.dim}...")
     model = SerriformNet(
         vocab_size=vocab_size,
         dim=args.dim,
         num_layers=args.num_layers,
         max_seq_len=args.max_seq_len,
-        dropout=args.dropout
+        dropout=args.dropout,
+        gradient_checkpointing=args.gradient_checkpointing,
+        dilations=custom_dilations
     ).to(device)
+    
+    # Check if model can run in half precision
+    if args.fp16 and not torch.cuda.is_available():
+        print("Warning: FP16 training requested but CUDA not available. Falling back to full precision.")
+        args.fp16 = False
+    elif args.fp16:
+        # Test model with a small batch in fp16
+        try:
+            dummy_input = torch.randint(0, vocab_size, (2, 10)).to(device)
+            with torch.cuda.amp.autocast():
+                _ = model(dummy_input)
+            print("Model successfully tested with mixed precision.")
+        except Exception as e:
+            print(f"Warning: Model failed to run in mixed precision: {e}. Falling back to full precision.")
+            args.fp16 = False
     
     # Print model summary
     total_params = sum(p.numel() for p in model.parameters())
@@ -933,7 +1201,9 @@ def main():
             device,
             log_interval=args.log_interval,
             grad_clip=args.grad_clip,
-            use_wandb=args.use_wandb
+            use_wandb=args.use_wandb,
+            fp16=args.fp16,
+            log_memory=args.log_memory
         )
         
         # Epoch complete
@@ -944,7 +1214,9 @@ def main():
             model, 
             val_dataloader, 
             device,
-            max_eval_batches=args.max_eval_batches
+            max_eval_batches=args.max_eval_batches,
+            fp16=args.fp16,
+            log_layer_metrics=args.log_layer_metrics
         )
         
         val_loss = val_metrics['loss']
@@ -1037,4 +1309,13 @@ def main():
             pass
 
 if __name__ == "__main__":
+    # Import optional modules that may be needed
+    import contextlib  # For nullcontext
+    try:
+        import torchinfo
+        # Use torchinfo to print model summary if available
+        TORCHINFO_AVAILABLE = True
+    except ImportError:
+        TORCHINFO_AVAILABLE = False
+    
     main()

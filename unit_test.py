@@ -338,14 +338,13 @@ class TestSerriformNetComponents(unittest.TestCase):
         
     def test_full_model(self):
         """Test the full improved SerriformNet model."""
-        # Use fewer layers to speed up test
+        # Instantiate the model
         num_layers = 2
         model = SerriformNet(
             vocab_size=self.vocab_size,
             dim=self.dim,
             num_layers=num_layers,
-            max_seq_len=self.seq_len,
-            dropout=0.1
+            max_seq_len=self.seq_len
         ).to(self.device)
         
         # Forward pass with standard signature (no caching)
@@ -359,7 +358,7 @@ class TestSerriformNetComponents(unittest.TestCase):
         # Forward pass with caching
         outputs_cache = model(self.x, use_cache=True, return_dict=True)
         logits_cache = outputs_cache['logits']
-        past_key_values = outputs_cache['past_key_values']
+        past_key_values = outputs_cache['past_memory_states']
         
         # Check cache
         self.assertIsNotNone(past_key_values)
