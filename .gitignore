@@ -1,7 +1,52 @@
-./data/*
-./logs/*
-./models/*
-./runs/*
-./tests/*
-./__pycache__/*
-./checkpoints/*
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# PyCharm files
+.idea/
+
+# VS Code files
+.vscode/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Logs
+logs/
+*.log
+
+# Models and data
+checkpoints/
+data/
+*.pt
+*.pth
+*.bin
+*.npz
+*.pkl
+
+# Weights & Biases
+wandb/
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# Development-specific files
+*.swp
+*.bak
+*.tmp
+*~
