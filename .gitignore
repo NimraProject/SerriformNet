@@ -1,0 +1,7 @@
+./data/*
+./logs/*
+./models/*
+./runs/*
+./tests/*
+./__pycache__/*
+./checkpoints/*
